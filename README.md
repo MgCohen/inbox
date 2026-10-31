@@ -5,7 +5,7 @@ It makes no decisions and does no work. Other tools read the events through the 
 
 - **URL:** https://inbox.mgcohen.workers.dev
 - **Runtime:** Cloudflare Workers (free plan)
-- **Storage:** D1 database `webhook-hub`, table `events`
+- **Storage:** D1 database `webhook-hub`, tables `events` and `consumptions`
 
 ## Endpoints
 
@@ -14,8 +14,10 @@ It makes no decisions and does no work. Other tools read the events through the 
 | `GET` | `/` | none | Health check. Lists the defined sources. |
 | `POST` | `/hooks/linear` | Linear signature (`linear-signature`) | Receive a Linear webhook. |
 | `POST` | `/hooks/github` | GitHub signature (`x-hub-signature-256`) | Receive a GitHub webhook. |
-| `GET` | `/api/events` | `Authorization: Bearer <INBOX_TOKEN>` | List events. |
-| `GET` | `/api/events/:id` | `Authorization: Bearer <INBOX_TOKEN>` | One event with its full payload. |
+| `GET` | `/api/events` | `Authorization: Bearer <INBOX_TOKEN>` | List events. Can also consume them. |
+| `GET` | `/api/events/:id` | `Authorization: Bearer <INBOX_TOKEN>` | One event with its full payload and its consumers. |
+| `POST` | `/api/consume` | `Authorization: Bearer <INBOX_TOKEN>` | Mark many events as consumed. |
+| `POST` | `/api/events/:id/consume` | `Authorization: Bearer <INBOX_TOKEN>` | Mark one event as consumed. |
 
 ### `GET /api/events` parameters
 
@@ -26,8 +28,26 @@ It makes no decisions and does no work. Other tools read the events through the 
 | `after` | Only events with an ID greater than this. Returns the oldest first, and `next_after` for the next call. |
 | `limit` | 1 to 200. Default 50. |
 | `payload=1` | Include the full JSON body of each event. |
+| `consumer` | The name of the reading tool, for example `claude-runner` (lowercase letters, digits, `-`, `_`). Adds `consumed_at` to each event. |
+| `pending=1` | Only events that this consumer has not consumed. Returns the oldest first. Needs `consumer`. |
+| `consume=1` | Mark every returned event as consumed by this consumer. Needs `consumer`. |
 
-Without `after`, the list returns the newest events first.
+Without `after` or `pending`, the list returns the newest events first.
+
+## Consume
+
+Each consumer has its own consumed state. An event that one tool consumed is still pending for every other tool.
+
+Two ways to consume:
+
+1. **On read:** `GET /api/events?consumer=X&pending=1&consume=1` returns the pending events and marks them in the same call. Two parallel calls never get the same event. If the consumer fails after the read, the event is lost for it. Use this when a lost event is acceptable.
+2. **After the work:** read with `GET /api/events?consumer=X&pending=1`, do the work, then mark the events:
+   - `POST /api/consume` with `{"consumer": "X", "ids": [12, 13]}` (1 to 500 IDs)
+   - `POST /api/events/12/consume` with `{"consumer": "X"}`
+
+   If the consumer fails before it marks an event, the event stays pending and comes again. The consumer must accept that an event can come two times.
+
+The consume response lists `consumed` (new for this consumer), `already` (consumed before) and `unknown` (no such event). The single-event call returns 404 for an unknown event. When an event is deleted, its consume rows are deleted too.
 
 ## Behavior
 
