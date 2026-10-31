@@ -42,6 +42,16 @@ function Get-Api($path, $auth = $true) {
     }
 }
 
+function Post-Api($path, $body) {
+    try {
+        $r = Invoke-WebRequest "$BaseUrl$path" -Method Post -Headers @{ Authorization = "Bearer $Token" } `
+            -ContentType 'application/json' -Body ($body | ConvertTo-Json -Compress -Depth 5) -UseBasicParsing
+        return @{ Status = [int]$r.StatusCode; Body = ($r.Content | ConvertFrom-Json) }
+    } catch {
+        return @{ Status = [int]$_.Exception.Response.StatusCode; Body = $null }
+    }
+}
+
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $delivery = [guid]::NewGuid().ToString()
 $body = @{
@@ -79,6 +89,45 @@ Check 'get by id returns the full payload' ($r.Status -eq 200 -and $r.Body.paylo
 
 $r = Get-Api "/api/events?after=$($latest.id - 1)&payload=1"
 Check 'read forward with after returns the event and next_after' ($r.Status -eq 200 -and $r.Body.events[0].id -eq $latest.id -and $r.Body.next_after -eq $latest.id)
+
+# Consume
+$id = $latest.id
+$window = "after=$($id - 1)"   # only the smoke event, also on a database with real events
+$run = Get-Random -Maximum 1000000
+$a = "smoke-a-$run"; $b = "smoke-b-$run"; $c = "smoke-c-$run"
+
+$r = Get-Api '/api/events?pending=1'
+Check 'pending without consumer is rejected (400)' ($r.Status -eq 400)
+
+$r = Get-Api '/api/events?consumer=Bad%20Name'
+Check 'invalid consumer name is rejected (400)' ($r.Status -eq 400)
+
+$r = Get-Api "/api/events?consumer=$a&pending=1&$window"
+Check 'new event is pending for a consumer' ($r.Status -eq 200 -and ($r.Body.events.id -contains $id) -and $null -eq $r.Body.events[0].consumed_at)
+
+$r = Get-Api "/api/events?consumer=$a&pending=1&consume=1&$window"
+Check 'consume=1 returns the event and marks it' ($r.Status -eq 200 -and ($r.Body.events.id -contains $id) -and $r.Body.events[0].consumed_at)
+
+$r = Get-Api "/api/events?consumer=$a&pending=1&$window"
+Check 'consumed event is no longer pending for that consumer' ($r.Status -eq 200 -and -not ($r.Body.events.id -contains $id))
+
+$r = Get-Api "/api/events?consumer=$b&pending=1&$window"
+Check 'event is still pending for another consumer' ($r.Status -eq 200 -and ($r.Body.events.id -contains $id))
+
+$r = Post-Api '/api/consume' @{ consumer = $b; ids = @($id, 999999999) }
+Check 'bulk consume marks known ids and lists unknown ids' ($r.Status -eq 200 -and ($r.Body.consumed -contains $id) -and ($r.Body.unknown -contains 999999999))
+
+$r = Post-Api '/api/consume' @{ consumer = $b; ids = @($id) }
+Check 'bulk consume again reports already consumed' ($r.Status -eq 200 -and ($r.Body.already -contains $id) -and $r.Body.consumed.Count -eq 0)
+
+$r = Post-Api "/api/events/$id/consume" @{ consumer = $c }
+Check 'single consume marks the event' ($r.Status -eq 200 -and ($r.Body.consumed -contains $id))
+
+$r = Post-Api '/api/events/999999999/consume' @{ consumer = $c }
+Check 'single consume of unknown event is 404' ($r.Status -eq 404)
+
+$r = Get-Api "/api/events/$id"
+Check 'get by id lists the three consumers' ($r.Status -eq 200 -and @($r.Body.consumers).Count -eq 3)
 
 if ($failures) { Write-Host "$failures check(s) failed" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green
