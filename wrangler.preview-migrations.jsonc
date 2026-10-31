@@ -1,0 +1,17 @@
+// Only for applying migrations to the preview database.
+// `wrangler d1 migrations apply` reads top-level d1_databases, so this file
+// points the DB binding at webhook-hub-preview. Keep it in sync with the
+// "previews" block in wrangler.jsonc.
+{
+  "name": "inbox",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "webhook-hub-preview",
+      "database_id": "2523bfc5-9c1e-453c-9251-19aec2fb6540",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

@@ -79,9 +79,17 @@ In a second terminal, run the smoke test:
 
 ## Deploy
 
-A merge to `main` deploys through Cloudflare Workers Builds. The deploy command applies the D1 migrations first.
+A merge to `main` deploys through Cloudflare Workers Builds with `npm run deploy`. That command applies the D1 migrations first.
 
 To deploy by hand: `npm run deploy`. To return to the previous version: `npx wrangler rollback`.
+
+### PR previews
+
+Each branch gets a preview at `https://<branch>-inbox.mgcohen.workers.dev`, built with `npm run deploy:preview`.
+
+- Previews use their own database, `webhook-hub-preview` (the `previews` block in `wrangler.jsonc`). They never touch production data.
+- `npm run migrate:preview` applies migrations to that database through `wrangler.preview-migrations.jsonc`. Keep the database ID in that file and in the `previews` block the same.
+- Previews have no secrets by default, so `/hooks/*` returns 503 and `/api/*` returns 401. To test them on a preview, set preview secrets with `npx wrangler preview secret`.
 
 ## Start and stop
 
