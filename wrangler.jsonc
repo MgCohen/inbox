@@ -12,7 +12,18 @@
       "database_id": "9a4adcd9-0e16-42a8-ac39-8c7f549d3c89",
       "migrations_dir": "migrations"
     }
-  ]
+  ],
+  // PR previews (Workers Builds) use their own database, never production data.
+  // Its migrations run through wrangler.preview-migrations.jsonc.
+  "previews": {
+    "d1_databases": [
+      {
+        "binding": "DB",
+        "database_name": "webhook-hub-preview",
+        "database_id": "2523bfc5-9c1e-453c-9251-19aec2fb6540"
+      }
+    ]
+  }
   // Secrets (set with `wrangler secret put <NAME>`, never in this file):
   //   INBOX_TOKEN            bearer token for the /api/* read API
   //   LINEAR_WEBHOOK_SECRET  signing secret from the Linear webhook
