@@ -83,6 +83,21 @@ A merge to `main` deploys through Cloudflare Workers Builds with `npm run deploy
 
 To deploy by hand: `npm run deploy`. To return to the previous version: `npx wrangler rollback`.
 
+### Build settings
+
+The build settings are stored in Cloudflare, not in this repository. Keep this table in sync with them.
+
+| Setting | Value |
+|---|---|
+| Repository and branch | `MgCohen/inbox`, `main` |
+| Root directory | `/` |
+| Build command | empty |
+| Production deploy command | `npm run deploy` |
+| Preview deploy command | `npm run deploy:preview` |
+| Previews | on, for every branch except `main` |
+
+To read them: `GET /accounts/<account>/builds/workers/<script_tag>` with a token that has **Workers CI Read**.
+
 ### PR previews
 
 Each branch gets a preview at `https://<branch>-inbox.mgcohen.workers.dev`, built with `npm run deploy:preview`.
