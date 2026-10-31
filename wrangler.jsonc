@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inbox",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "webhook-hub",
+      "database_id": "9a4adcd9-0e16-42a8-ac39-8c7f549d3c89",
+      "migrations_dir": "migrations"
+    }
+  ]
+  // Secrets (set with `wrangler secret put <NAME>`, never in this file):
+  //   INBOX_TOKEN            bearer token for the /api/* read API
+  //   LINEAR_WEBHOOK_SECRET  signing secret from the Linear webhook
+  //   GITHUB_WEBHOOK_SECRET  secret from the GitHub webhook (later)
+}

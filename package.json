@@ -1,0 +1,16 @@
+{
+  "name": "inbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that receives signed webhooks, stores them in D1, and returns them on demand.",
+  "scripts": {
+    "dev": "wrangler dev --port 8787 --ip 127.0.0.1",
+    "migrate:local": "wrangler d1 migrations apply webhook-hub --local",
+    "migrate:remote": "wrangler d1 migrations apply webhook-hub --remote",
+    "deploy": "wrangler d1 migrations apply webhook-hub --remote && wrangler deploy",
+    "tail": "wrangler tail inbox"
+  },
+  "devDependencies": {
+    "wrangler": "4.156.0"
+  }
+}
