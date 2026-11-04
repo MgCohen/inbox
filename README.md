@@ -14,6 +14,7 @@ It makes no decisions and does no work. Other tools read the events through the 
 | `GET` | `/` | none | Health check. Lists the defined sources. |
 | `POST` | `/hooks/linear` | Linear signature (`linear-signature`) | Receive a Linear webhook. |
 | `POST` | `/hooks/github` | GitHub signature (`x-hub-signature-256`) | Receive a GitHub webhook. |
+| `POST` | `/hooks/notion` | Notion signature (`x-notion-signature`) | Receive a Notion webhook. |
 | `GET` | `/api/events` | `Authorization: Bearer <INBOX_TOKEN>` | List events. Can also consume them. |
 | `GET` | `/api/events/:id` | `Authorization: Bearer <INBOX_TOKEN>` | One event with its full payload and its consumers. |
 | `POST` | `/api/consume` | `Authorization: Bearer <INBOX_TOKEN>` | Mark many events as consumed. |
@@ -51,7 +52,7 @@ The consume response lists `consumed` (new for this consumer), `already` (consum
 
 ## Behavior
 
-- A source without a secret accepts nothing (503).
+- A source without a secret accepts nothing (503). The one exception is the Notion handshake (see [Notion](#notion)).
 - A bad signature gets 401. A Linear delivery older than 5 minutes gets 401.
 - Each delivery is stored one time. A delivery with a known delivery ID returns 200 with `"duplicate": true`.
 - An unknown source gets 404.
@@ -66,6 +67,7 @@ Secrets are only in Cloudflare and in local files that git ignores. Never put th
 | `INBOX_TOKEN` | Bearer token for `/api/*`. A local copy is in `.env`. |
 | `LINEAR_WEBHOOK_SECRET` | Signing secret from the Linear webhook. |
 | `GITHUB_WEBHOOK_SECRET` | Secret from the GitHub webhook. |
+| `NOTION_WEBHOOK_SECRET` | The `verification_token` of the Notion webhook subscription. |
 
 Set a secret with `npx wrangler secret put <NAME>`. In Windows PowerShell, do not pipe the value into that command, because PowerShell adds characters. Type the value at the prompt, or use `npx wrangler secret bulk <file.json>`.
 
@@ -75,6 +77,30 @@ Set a secret with `npx wrangler secret put <NAME>`. In Windows PowerShell, do no
 2. Deploy.
 3. In the service, add a webhook with the URL `https://inbox.mgcohen.workers.dev/hooks/<name>`.
 4. Set the secret in Cloudflare.
+
+## Notion
+
+Notion signs each event with the `verification_token` of the subscription. Notion sends that token one time, unsigned, when you create the subscription.
+
+| `NOTION_WEBHOOK_SECRET` | Request to `/hooks/notion` | Result |
+|---|---|---|
+| Not set | Body is only `{"verification_token": "secret_..."}` | 200. The token goes to the Worker log. D1 stores nothing. |
+| Not set | Any other body | 503 |
+| Set | Valid `x-notion-signature` | 200. The event is stored. |
+| Set | Missing or bad signature | 401 |
+
+The event type `page.properties_updated` is stored as `event_type` `page` and `action` `properties_updated`. The delivery ID is the event `id`. Notion events contain IDs only. A consumer must read the page through the Notion API.
+
+To connect a subscription:
+
+1. Make sure that `NOTION_WEBHOOK_SECRET` is not set.
+2. Run `npm run tail`.
+3. In the Notion connection settings, open **Webhooks** and create a subscription with the URL `https://inbox.mgcohen.workers.dev/hooks/notion`.
+4. Copy the token from the log line `notion handshake token: secret_...`.
+5. Set it with `npx wrangler secret put NOTION_WEBHOOK_SECRET`.
+6. In Notion, paste the token and click **Verify subscription**.
+
+One Worker holds one Notion secret, so it accepts one subscription.
 
 ## Develop and test
 
@@ -95,6 +121,13 @@ In a second terminal, run the smoke test:
 
 ```powershell
 .\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret
+```
+
+Without `-NotionSecret`, the test checks the Notion handshake. The Worker must have no `NOTION_WEBHOOK_SECRET`. To check signed Notion events, start the Worker with a local secret and give the same value to the test:
+
+```powershell
+npx wrangler dev --port 8787 --ip 127.0.0.1 --var NOTION_WEBHOOK_SECRET:local-notion-secret
+.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret -NotionSecret local-notion-secret
 ```
 
 ## Deploy

@@ -37,6 +37,41 @@ const SOURCES = {
       };
     },
   },
+  notion: {
+    secretVar: "NOTION_WEBHOOK_SECRET",
+    async verify(request, rawBody, secret) {
+      const header = request.headers.get("x-notion-signature") ?? "";
+      if (!header.startsWith("sha256=")) return false;
+      return verifyHmacHex(secret, rawBody, header.slice("sha256=".length));
+    },
+    // Notion signs events with the verification token, and it sends that token
+    // one time, unsigned, when a subscription is created. While the secret is not
+    // set, accept only that exact message and write the token to the Worker log
+    // (`npm run tail`), so that it can be set as NOTION_WEBHOOK_SECRET.
+    // Nothing is stored in D1.
+    handshake(rawBody) {
+      let body;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return null;
+      }
+      const keys = body && typeof body === "object" ? Object.keys(body) : [];
+      const token = body?.verification_token;
+      if (keys.length !== 1 || typeof token !== "string") return null;
+      if (!/^secret_[A-Za-z0-9]{20,100}$/.test(token)) return null;
+      return { token };
+    },
+    describe(request, body) {
+      // "page.properties_updated" → event type "page", action "properties_updated".
+      const [eventType, ...rest] = String(body.type ?? "").split(".");
+      return {
+        deliveryId: body.id ?? crypto.randomUUID(),
+        eventType: eventType || null,
+        action: rest.length ? rest.join(".") : null,
+      };
+    },
+  },
 };
 
 export default {
@@ -86,11 +121,17 @@ async function receiveHook(sourceName, request, env) {
   const source = SOURCES[sourceName];
   if (!source) return json({ error: "unknown source" }, 404);
 
-  // Fail closed: a source without a secret accepts nothing.
+  // Fail closed: a source without a secret stores nothing. It can only answer
+  // its own setup handshake (see SOURCES.notion.handshake).
   const secret = env[source.secretVar];
-  if (!secret) return json({ error: "source not configured" }, 503);
-
   const rawBody = await request.text();
+  if (!secret) {
+    const handshake = source.handshake?.(rawBody);
+    if (!handshake) return json({ error: "source not configured" }, 503);
+    console.log(`${sourceName} handshake token: ${handshake.token}`);
+    return json({ ok: true, handshake: true });
+  }
+
   let verified = false;
   try {
     verified = await source.verify(request, rawBody, secret);
