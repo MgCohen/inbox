@@ -1,9 +1,12 @@
 # Smoke test for the inbox: receive, store, retrieve.
-# Usage: .\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token <INBOX_TOKEN> -LinearSecret <LINEAR_WEBHOOK_SECRET>
+# Usage: .\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token <INBOX_TOKEN> -LinearSecret <LINEAR_WEBHOOK_SECRET> [-NotionSecret <NOTION_WEBHOOK_SECRET>]
+# Without -NotionSecret, the Worker must have no NOTION_WEBHOOK_SECRET, and the test checks the Notion handshake.
+# With -NotionSecret, the test checks signed Notion events.
 param(
     [Parameter(Mandatory)] [string] $BaseUrl,
     [Parameter(Mandatory)] [string] $Token,
-    [Parameter(Mandatory)] [string] $LinearSecret
+    [Parameter(Mandatory)] [string] $LinearSecret,
+    [string] $NotionSecret
 )
 
 $ErrorActionPreference = 'Stop'
@@ -128,6 +131,55 @@ Check 'single consume of unknown event is 404' ($r.Status -eq 404)
 
 $r = Get-Api "/api/events/$id"
 Check 'get by id lists the three consumers' ($r.Status -eq 200 -and @($r.Body.consumers).Count -eq 3)
+
+# Notion
+function Send-Notion($body, $signature) {
+    $headers = @{}
+    if ($signature) { $headers['x-notion-signature'] = "sha256=$signature" }
+    try {
+        $r = Invoke-WebRequest "$BaseUrl/hooks/notion" -Method Post -Body $body -ContentType 'application/json' `
+            -Headers $headers -UseBasicParsing
+        return @{ Status = [int]$r.StatusCode; Body = ($r.Content | ConvertFrom-Json) }
+    } catch {
+        return @{ Status = [int]$_.Exception.Response.StatusCode; Body = $null }
+    }
+}
+
+$notionId = [guid]::NewGuid().ToString()
+$notionBody = @{
+    id = $notionId; timestamp = (Get-Date).ToUniversalTime().ToString('o'); type = 'page.properties_updated'
+    attempt_number = 1; entity = @{ id = [guid]::NewGuid().ToString(); type = 'page' }; data = @{}
+} | ConvertTo-Json -Compress -Depth 5
+
+if ($NotionSecret) {
+    $r = Send-Notion $notionBody (Sign $NotionSecret $notionBody)
+    Check 'notion: valid signed event is accepted' ($r.Status -eq 200 -and -not $r.Body.duplicate)
+
+    $r = Send-Notion $notionBody (Sign $NotionSecret $notionBody)
+    Check 'notion: same event id again is a duplicate' ($r.Status -eq 200 -and $r.Body.duplicate)
+
+    $r = Send-Notion $notionBody ('0' * 64)
+    Check 'notion: bad signature is rejected (401)' ($r.Status -eq 401)
+
+    $r = Send-Notion '{"verification_token":"secret_abcdefghijklmnopqrstuvwxyz0123"}' $null
+    Check 'notion: unsigned handshake is rejected when the secret is set (401)' ($r.Status -eq 401)
+
+    $r = Get-Api '/api/events?source=notion&limit=1'
+    $n = $r.Body.events | Select-Object -First 1
+    Check 'notion: event type and action come from the dotted type' ($n.delivery_id -eq $notionId -and $n.event_type -eq 'page' -and $n.action -eq 'properties_updated')
+} else {
+    $r = Send-Notion '{"verification_token":"secret_abcdefghijklmnopqrstuvwxyz0123"}' $null
+    Check 'notion: handshake is answered without a secret' ($r.Status -eq 200 -and $r.Body.handshake)
+
+    $r = Send-Notion $notionBody $null
+    Check 'notion: an event without a secret is rejected (503)' ($r.Status -eq 503)
+
+    $r = Send-Notion '{"verification_token":"secret_abcdefghijklmnopqrstuvwxyz0123","x":1}' $null
+    Check 'notion: a handshake with extra fields is rejected (503)' ($r.Status -eq 503)
+
+    $r = Get-Api '/api/events?source=notion&limit=5'
+    Check 'notion: the handshake stores nothing' ($r.Status -eq 200 -and @($r.Body.events).Count -eq 0)
+}
 
 if ($failures) { Write-Host "$failures check(s) failed" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

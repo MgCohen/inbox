@@ -16,7 +16,7 @@ npm run dev
 
 **Keep the inbox small.** It receives, stores and returns events. Do not add routing, decisions or actions here. Those belong in the tools that read the events.
 
-**Fail closed.** A source without a secret accepts nothing. Every new source must verify a signature or a secret before it stores anything.
+**Fail closed.** A source without a secret accepts nothing. Every new source must verify a signature or a secret before it stores anything. The one exception is the Notion handshake: it writes the token to the log and stores nothing.
 
 **No secrets in git.** Secrets go in Cloudflare (`wrangler secret`), `.dev.vars` or `.env`. Never in code, `wrangler.jsonc`, tests or docs.
 
