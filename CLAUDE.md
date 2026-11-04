@@ -11,7 +11,7 @@ This repository is the `inbox` Cloudflare Worker. Read [README.md](README.md) fo
 ```powershell
 npm run migrate:local
 npm run dev
-.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret
+.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret -Local
 ```
 
 **Keep the inbox small.** It receives, stores and returns events. Do not add routing, decisions or actions here. Those belong in the tools that read the events.

@@ -1,12 +1,15 @@
-# Smoke test for the inbox: receive, store, retrieve.
-# Usage: .\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token <INBOX_TOKEN> -LinearSecret <LINEAR_WEBHOOK_SECRET> [-NotionSecret <NOTION_WEBHOOK_SECRET>]
+# Smoke test for the inbox: receive, store, retrieve, push, settle, clean up.
+# Usage: .\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token <INBOX_TOKEN> -LinearSecret <LINEAR_WEBHOOK_SECRET> [-NotionSecret <NOTION_WEBHOOK_SECRET>] [-Local]
 # Without -NotionSecret, the Worker must have no NOTION_WEBHOOK_SECRET, and the test checks the Notion handshake.
 # With -NotionSecret, the test checks signed Notion events.
+# With -Local, the Worker must run on this machine with `wrangler dev --test-scheduled`.
+# The test then changes times in the local D1 to check the settled rule and the daily cleanup.
 param(
     [Parameter(Mandatory)] [string] $BaseUrl,
     [Parameter(Mandatory)] [string] $Token,
     [Parameter(Mandatory)] [string] $LinearSecret,
-    [string] $NotionSecret
+    [string] $NotionSecret,
+    [switch] $Local
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +135,36 @@ Check 'single consume of unknown event is 404' ($r.Status -eq 404)
 $r = Get-Api "/api/events/$id"
 Check 'get by id lists the three consumers' ($r.Status -eq 200 -and @($r.Body.consumers).Count -eq 3)
 
+# Settled
+# Runs SQL on the local D1 of `wrangler dev` and returns the result rows.
+function Invoke-LocalSql($sql) {
+    Push-Location (Join-Path $PSScriptRoot '..')
+    try {
+        $out = & npx wrangler d1 execute webhook-hub --local --json --command $sql 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "wrangler d1 execute failed: $sql" }
+        return (($out -join "`n") | ConvertFrom-Json)[0].results
+    } finally { Pop-Location }
+}
+
+function IsoUtc($offset) { [DateTime]::UtcNow.Add($offset).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'") }
+
+$d = "smoke-d-$run"
+$r = Get-Api "/api/events?consumer=$d&pending=1&$window"
+Check 'event consumed less than 1 hour ago is still pending for another consumer' ($r.Status -eq 200 -and ($r.Body.events.id -contains $id))
+
+if ($Local) {
+    $twoHoursAgo = IsoUtc ([TimeSpan]::FromHours(-2))
+    Invoke-LocalSql "UPDATE consumptions SET consumed_at = '$twoHoursAgo' WHERE event_id = $id AND consumer = '$a'" | Out-Null
+
+    $r = Get-Api "/api/events?consumer=$d&pending=1&$window"
+    Check 'settled event (first consume 1 hour ago or more) is not pending' ($r.Status -eq 200 -and -not ($r.Body.events.id -contains $id))
+
+    $r = Get-Api "/api/events?consumer=$d&pending=1&settled=1&$window"
+    Check 'settled=1 returns the settled event' ($r.Status -eq 200 -and ($r.Body.events.id -contains $id))
+} else {
+    Write-Host 'SKIP  settled rule (needs -Local)' -ForegroundColor Yellow
+}
+
 # Notion
 function Send-Notion($body, $signature) {
     $headers = @{}
@@ -168,6 +201,10 @@ if ($NotionSecret) {
     $n = $r.Body.events | Select-Object -First 1
     Check 'notion: event type and action come from the dotted type' ($n.delivery_id -eq $notionId -and $n.event_type -eq 'page' -and $n.action -eq 'properties_updated')
 } else {
+    # The newest Notion event before the handshake. A database can hold events from a signed run.
+    $before = @((Get-Api '/api/events?source=notion&limit=1').Body.events) | Select-Object -First 1
+    $beforeId = if ($before) { $before.id } else { 0 }
+
     $r = Send-Notion '{"verification_token":"secret_abcdefghijklmnopqrstuvwxyz0123"}' $null
     Check 'notion: handshake is answered without a secret' ($r.Status -eq 200 -and $r.Body.handshake)
 
@@ -177,8 +214,92 @@ if ($NotionSecret) {
     $r = Send-Notion '{"verification_token":"secret_abcdefghijklmnopqrstuvwxyz0123","x":1}' $null
     Check 'notion: a handshake with extra fields is rejected (503)' ($r.Status -eq 503)
 
-    $r = Get-Api '/api/events?source=notion&limit=5'
+    $r = Get-Api "/api/events?source=notion&after=$beforeId&limit=5"
     Check 'notion: the handshake stores nothing' ($r.Status -eq 200 -and @($r.Body.events).Count -eq 0)
+}
+
+# Listen
+$r = Get-Api "/listen?consumer=smoke-listen-$run" $false
+Check 'listen without token is rejected (401)' ($r.Status -eq 401)
+
+$r = Get-Api '/listen?consumer=Bad%20Name'
+Check 'listen with an invalid consumer name is rejected (400)' ($r.Status -eq 400)
+
+# Waits for one text message. Returns $null after the timeout.
+function Receive-Message($ws, $timeoutMs) {
+    if (-not $script:pendingReceive) {
+        $script:receiveBuffer = [ArraySegment[byte]]::new([byte[]]::new(65536))
+        $script:pendingReceive = $ws.ReceiveAsync($script:receiveBuffer, [Threading.CancellationToken]::None)
+    }
+    if (-not $script:pendingReceive.Wait($timeoutMs)) { return $null }
+    $result = $script:pendingReceive.Result
+    $script:pendingReceive = $null
+    if ($result.MessageType -ne [Net.WebSockets.WebSocketMessageType]::Text) { return $null }
+    $text = [Text.Encoding]::UTF8.GetString($script:receiveBuffer.Array, 0, $result.Count)
+    return ($text | ConvertFrom-Json)
+}
+
+$listener = "smoke-listen-$run"
+$ws = [Net.WebSockets.ClientWebSocket]::new()
+$ws.Options.SetRequestHeader('Authorization', "Bearer $Token")
+$wsUrl = ($BaseUrl -replace '^http', 'ws') + "/listen?consumer=$listener"
+$connected = $false
+try { $connected = $ws.ConnectAsync([Uri]$wsUrl, [Threading.CancellationToken]::None).Wait(10000) } catch { $connected = $false }
+Check 'listen with a valid token opens a WebSocket' ($connected -and $ws.State -eq 'Open')
+
+if ($connected) {
+    $m = Receive-Message $ws 10000
+    Check 'listen sends hello with the consumer name' ($m.kind -eq 'hello' -and $m.consumer -eq $listener)
+
+    $pushDelivery = [guid]::NewGuid().ToString()
+    $pushBody = $body.Replace('"MAT-47"', '"MAT-PUSH"').Replace("$now", "$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())")
+    $pushSig = Sign $LinearSecret $pushBody
+    $r = Send $pushBody $pushSig $pushDelivery
+    Check 'webhook with an open listener is accepted' ($r.Status -eq 200 -and -not $r.Body.duplicate)
+
+    $m = Receive-Message $ws 10000
+    $e = $m.event
+    Check 'listen pushes the new event' ($m.kind -eq 'event' -and $e.delivery_id -eq $pushDelivery -and $e.payload.data.identifier -eq 'MAT-PUSH')
+
+    $r = Get-Api "/api/events?after=$($e.id - 1)&limit=1&payload=1"
+    $apiEvent = $r.Body.events | Select-Object -First 1
+    $pushNames = ($e.PSObject.Properties.Name | Sort-Object) -join ','
+    $apiNames = ($apiEvent.PSObject.Properties.Name | Sort-Object) -join ','
+    Check 'pushed event has the shape of GET /api/events?payload=1' ($apiEvent.id -eq $e.id -and $pushNames -eq $apiNames -and $apiEvent.received_at -eq $e.received_at)
+
+    $r = Send $pushBody $pushSig $pushDelivery
+    $m = Receive-Message $ws 2000
+    Check 'a duplicate delivery is not pushed' ($r.Status -eq 200 -and $r.Body.duplicate -and $null -eq $m)
+
+    $ws.Abort()
+}
+$ws.Dispose()
+
+# Cleanup (daily cron)
+if ($Local) {
+    $oldConsumer = "smoke-old-$run"
+    $eightDaysAgo = IsoUtc ([TimeSpan]::FromDays(-8))
+    $sixDaysAgo = IsoUtc ([TimeSpan]::FromDays(-6))
+    Invoke-LocalSql ("INSERT INTO events (source, delivery_id, payload, received_at) VALUES " +
+        "('smoke', 'old-$run', '{}', '$eightDaysAgo'), ('smoke', 'recent-$run', '{}', '$sixDaysAgo'); " +
+        "INSERT INTO consumptions (event_id, consumer) SELECT id, '$oldConsumer' FROM events WHERE source = 'smoke' AND delivery_id IN ('old-$run', 'recent-$run')") | Out-Null
+
+    try {
+        $r = Invoke-WebRequest "$BaseUrl/__scheduled?cron=17+3+*+*+*" -UseBasicParsing
+        $status = [int]$r.StatusCode
+    } catch { $status = 0 }
+    Check 'cron runs with --test-scheduled' ($status -eq 200)
+
+    $rows = Invoke-LocalSql "SELECT delivery_id FROM events WHERE source = 'smoke' AND delivery_id IN ('old-$run', 'recent-$run')"
+    Check 'cron deletes the event received 7 days ago or more' (-not (@($rows).delivery_id -contains "old-$run"))
+    Check 'cron keeps the event received less than 7 days ago' (@($rows).delivery_id -contains "recent-$run")
+
+    $rows = Invoke-LocalSql "SELECT COUNT(*) AS n FROM consumptions WHERE consumer = '$oldConsumer'"
+    Check 'cron deletes the consume rows of the deleted event' (@($rows)[0].n -eq 1)
+
+    Invoke-LocalSql "DELETE FROM consumptions WHERE consumer = '$oldConsumer'; DELETE FROM events WHERE source = 'smoke' AND delivery_id = 'recent-$run'" | Out-Null
+} else {
+    Write-Host 'SKIP  daily cleanup (needs -Local)' -ForegroundColor Yellow
 }
 
 if ($failures) { Write-Host "$failures check(s) failed" -ForegroundColor Red; exit 1 }

@@ -13,8 +13,16 @@
       "migrations_dir": "migrations"
     }
   ],
+  // The hub that holds the /listen sockets (SQLite-backed, free plan).
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "ListenerHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ListenerHub"] }],
+  // Daily cleanup of old events, at 03:17 UTC.
+  "triggers": { "crons": ["17 3 * * *"] },
   // PR previews (Workers Builds) use their own database, never production data.
   // Its migrations run through wrangler.preview-migrations.jsonc.
+  // Each preview gets its own Durable Object namespace. Cron triggers do not run on previews.
   "previews": {
     "d1_databases": [
       {
@@ -22,10 +30,14 @@
         "database_name": "webhook-hub-preview",
         "database_id": "2523bfc5-9c1e-453c-9251-19aec2fb6540"
       }
-    ]
+    ],
+    "durable_objects": {
+      "bindings": [{ "name": "HUB", "class_name": "ListenerHub" }]
+    }
   }
   // Secrets (set with `wrangler secret put <NAME>`, never in this file):
-  //   INBOX_TOKEN            bearer token for the /api/* read API
+  //   INBOX_TOKEN            bearer token for /api/* and /listen
   //   LINEAR_WEBHOOK_SECRET  signing secret from the Linear webhook
-  //   GITHUB_WEBHOOK_SECRET  secret from the GitHub webhook (later)
+  //   GITHUB_WEBHOOK_SECRET  secret from the GitHub webhook
+  //   NOTION_WEBHOOK_SECRET  verification_token of the Notion webhook subscription
 }
