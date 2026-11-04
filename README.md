@@ -1,11 +1,20 @@
 # inbox
 
-A Cloudflare Worker that **receives** signed webhooks, **stores** them in D1, and **returns** them on demand.
-It makes no decisions and does no work. Other tools read the events through the API.
+A Cloudflare Worker that **receives** signed webhooks, **stores** them in D1, **pushes** them to open listeners, and **returns** them on demand.
+It makes no decisions and does no work. Other tools read the events through the API and get a push through `/listen`.
 
 - **URL:** https://inbox.mgcohen.workers.dev
 - **Runtime:** Cloudflare Workers (free plan)
 - **Storage:** D1 database `webhook-hub`, tables `events` and `consumptions`
+- **Hub:** Durable Object `ListenerHub` (SQLite-backed), one instance that holds the `/listen` sockets
+- **Contract:** contract A in `MgCohen/runner` `CONTRACTS.md`
+
+```
+source ──POST /hooks/<name>──► Worker ──INSERT──► D1
+                                  │
+                                  └──broadcast──► ListenerHub ──WebSocket──► listeners
+consumer ──GET /api/events, POST /api/consume──► Worker ──► D1
+```
 
 ## Endpoints
 
@@ -15,6 +24,7 @@ It makes no decisions and does no work. Other tools read the events through the 
 | `POST` | `/hooks/linear` | Linear signature (`linear-signature`) | Receive a Linear webhook. |
 | `POST` | `/hooks/github` | GitHub signature (`x-hub-signature-256`) | Receive a GitHub webhook. |
 | `POST` | `/hooks/notion` | Notion signature (`x-notion-signature`) | Receive a Notion webhook. |
+| `GET` | `/listen?consumer=<name>` | `Authorization: Bearer <INBOX_TOKEN>` | Open a WebSocket for the live push. |
 | `GET` | `/api/events` | `Authorization: Bearer <INBOX_TOKEN>` | List events. Can also consume them. |
 | `GET` | `/api/events/:id` | `Authorization: Bearer <INBOX_TOKEN>` | One event with its full payload and its consumers. |
 | `POST` | `/api/consume` | `Authorization: Bearer <INBOX_TOKEN>` | Mark many events as consumed. |
@@ -30,7 +40,8 @@ It makes no decisions and does no work. Other tools read the events through the 
 | `limit` | 1 to 200. Default 50. |
 | `payload=1` | Include the full JSON body of each event. |
 | `consumer` | The name of the reading tool, for example `claude-runner` (lowercase letters, digits, `-`, `_`). Adds `consumed_at` to each event. |
-| `pending=1` | Only events that this consumer has not consumed. Returns the oldest first. Needs `consumer`. |
+| `pending=1` | Only events that this consumer has not consumed and that are not settled. Returns the oldest first. Needs `consumer`. |
+| `settled=1` | With `pending=1`: also return settled events. |
 | `consume=1` | Mark every returned event as consumed by this consumer. Needs `consumer`. |
 
 Without `after` or `pending`, the list returns the newest events first.
@@ -50,13 +61,47 @@ Two ways to consume:
 
 The consume response lists `consumed` (new for this consumer), `already` (consumed before) and `unknown` (no such event). The single-event call returns 404 for an unknown event. When an event is deleted, its consume rows are deleted too.
 
+## Lifecycle
+
+| State | Rule | In `pending=1` |
+|---|---|---|
+| Received | No consume | Yes |
+| Consumed | First consume less than 1 hour ago | Yes, for other consumers |
+| Settled | First consume 1 hour ago or more | No. Yes with `settled=1`. |
+| Deleted | `received_at` 7 days ago or more | No. The row is gone. |
+
+The two times are constants in `src/index.js`: `SETTLE_AFTER_MS` (1 hour) and `RETENTION_MS` (7 days).
+
+A cron trigger runs the cleanup one time each day at 03:17 UTC (`triggers` in `wrangler.jsonc`). It deletes the consume rows of the old events first, and then the events. It deletes an event also when no consumer consumed it.
+
+## Listen
+
+`GET /listen?consumer=<name>` opens a WebSocket. The consumer name has the same rule as the API.
+
+| Message | When |
+|---|---|
+| `{"kind":"hello","consumer":"<name>"}` | One time, when the socket opens. |
+| `{"kind":"event","event":<event>}` | For each stored event. `<event>` has the shape of one item of `GET /api/events?payload=1`. |
+
+- The client sends nothing. The ack uses `POST /api/consume`.
+- The hub sends each event one time to each open socket. A duplicate delivery and the Notion handshake are not sent.
+- A push is a signal, not a guarantee. If the socket is closed, the push of that event is lost. Get the event with `GET /api/events?consumer=<name>&pending=1&payload=1`.
+- The hub uses the WebSocket Hibernation API. It sleeps between events and has no timers.
+- If the hub fails, the webhook still gets 200. The error goes to the Worker log.
+
+| Request | Result |
+|---|---|
+| No token or a bad token | 401 |
+| Bad consumer name | 400 |
+| No `Upgrade: websocket` header | 426 |
+
 ## Behavior
 
 - A source without a secret accepts nothing (503). The one exception is the Notion handshake (see [Notion](#notion)).
 - A bad signature gets 401. A Linear delivery older than 5 minutes gets 401.
 - Each delivery is stored one time. A delivery with a known delivery ID returns 200 with `"duplicate": true`.
 - An unknown source gets 404.
-- Events are not deleted automatically.
+- The daily cleanup deletes events 7 days after `received_at` (see [Lifecycle](#lifecycle)).
 
 ## Secrets
 
@@ -64,7 +109,7 @@ Secrets are only in Cloudflare and in local files that git ignores. Never put th
 
 | Name | Purpose |
 |---|---|
-| `INBOX_TOKEN` | Bearer token for `/api/*`. A local copy is in `.env`. |
+| `INBOX_TOKEN` | Bearer token for `/api/*` and `/listen`. A local copy is in `.env`. |
 | `LINEAR_WEBHOOK_SECRET` | Signing secret from the Linear webhook. |
 | `GITHUB_WEBHOOK_SECRET` | Secret from the GitHub webhook. |
 | `NOTION_WEBHOOK_SECRET` | The `verification_token` of the Notion webhook subscription. |
@@ -110,7 +155,7 @@ npm run migrate:local
 npm run dev
 ```
 
-`npm run dev` reads local secrets from `.dev.vars` (git ignores this file), for example:
+`npm run dev` starts the Worker with `--test-scheduled`, so that `GET /__scheduled` runs the cron. It reads local secrets from `.dev.vars` (git ignores this file), for example:
 
 ```
 INBOX_TOKEN=local-test-token
@@ -120,15 +165,17 @@ LINEAR_WEBHOOK_SECRET=local-linear-secret
 In a second terminal, run the smoke test:
 
 ```powershell
-.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret
+.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret -Local
 ```
 
 Without `-NotionSecret`, the test checks the Notion handshake. The Worker must have no `NOTION_WEBHOOK_SECRET`. To check signed Notion events, start the Worker with a local secret and give the same value to the test:
 
 ```powershell
-npx wrangler dev --port 8787 --ip 127.0.0.1 --var NOTION_WEBHOOK_SECRET:local-notion-secret
-.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret -NotionSecret local-notion-secret
+npx wrangler dev --port 8787 --ip 127.0.0.1 --test-scheduled --var NOTION_WEBHOOK_SECRET:local-notion-secret
+.\test\smoke.ps1 -BaseUrl http://127.0.0.1:8787 -Token local-test-token -LinearSecret local-linear-secret -NotionSecret local-notion-secret -Local
 ```
+
+`-Local` checks the settled rule and the daily cleanup. For these checks, the test changes times in the local D1 with `wrangler d1 execute --local` and calls `GET /__scheduled`. Use `-Local` only against `wrangler dev` on the same machine. Without `-Local`, the test skips these checks.
 
 ## Deploy
 
@@ -157,6 +204,7 @@ Each branch gets a preview at `https://<branch>-inbox.mgcohen.workers.dev`, buil
 
 - Previews use their own database, `webhook-hub-preview` (the `previews` block in `wrangler.jsonc`). They never touch production data.
 - `npm run migrate:preview` applies migrations to that database through `wrangler.preview-migrations.jsonc`. Keep the database ID in that file and in the `previews` block the same.
+- Each preview gets its own Durable Object namespace, so its hub never gets production events. Cron triggers do not run on previews.
 - Previews have no secrets by default, so `/hooks/*` returns 503 and `/api/*` returns 401. To test them on a preview, set preview secrets with `npx wrangler preview secret`.
 
 ## Start and stop
@@ -174,4 +222,4 @@ The Worker always runs. To stop it:
 
 ## Cost
 
-The free plan is enough. Its daily limits apply to the whole Cloudflare account: 100,000 Worker requests, 100,000 D1 rows written, 5 million D1 rows read, and 5 GB of D1 storage. If a limit is reached, requests fail until the next day. Nothing is charged.
+The free plan is enough. Its daily limits apply to the whole Cloudflare account: 100,000 Worker requests, 100,000 D1 rows written, 5 million D1 rows read, and 5 GB of D1 storage. Durable Objects have their own daily limit of 100,000 requests. Each stored event is one hub request, and each `/listen` connection is one hub request. Messages from the hub to the listeners cost nothing. If a limit is reached, requests fail until the next day. Nothing is charged.

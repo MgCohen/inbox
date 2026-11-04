@@ -1,7 +1,22 @@
 // Inbox: receives signed webhooks, stores them in D1, and returns them on demand.
-// It makes no decisions and does no work. Consumers read the events through /api/*.
+// It makes no decisions and does no work. Consumers read the events through /api/*
+// and get a live push of each new event through /listen.
+
+import { DurableObject } from "cloudflare:workers";
 
 const MAX_TIMESTAMP_SKEW_MS = 5 * 60 * 1000;
+
+// An event is settled when its first consume is this old or older.
+// "pending=1" does not return settled events. "settled=1" returns them too.
+const SETTLE_AFTER_MS = 60 * 60 * 1000; // 1 hour
+
+// The daily cron deletes events with received_at this old or older, consumed or not.
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// One hub instance holds all the open /listen sockets.
+const HUB_NAME = "listeners";
+
+const CONSUMER_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 // Each source says how to verify a delivery and how to read its metadata.
 const SOURCES = {
@@ -75,7 +90,7 @@ const SOURCES = {
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
@@ -87,7 +102,12 @@ export default {
       // Receive + store.
       const hookMatch = path.match(/^\/hooks\/([a-z0-9-]+)$/);
       if (hookMatch && request.method === "POST") {
-        return receiveHook(hookMatch[1], request, env);
+        return receiveHook(hookMatch[1], request, env, ctx);
+      }
+
+      // Live push. The hub holds the socket.
+      if (path === "/listen" && request.method === "GET") {
+        return listen(url, request, env);
       }
 
       // Retrieve + consume.
@@ -115,9 +135,70 @@ export default {
       return json({ error: "internal error" }, 500);
     }
   },
+
+  // Daily cleanup (cron in wrangler.jsonc).
+  async scheduled(controller, env, ctx) {
+    await deleteOldEvents(env);
+  },
 };
 
-async function receiveHook(sourceName, request, env) {
+// GET /listen?consumer=<name> with Authorization: Bearer <INBOX_TOKEN>.
+// The hub accepts the WebSocket and sends {"kind":"hello"} and then each new event.
+async function listen(url, request, env) {
+  if (!isAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
+  const consumer = url.searchParams.get("consumer");
+  if (!isValidConsumer(consumer)) return json({ error: "invalid consumer name" }, 400);
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "expected a websocket upgrade" }, 426);
+  }
+  return hub(env).fetch(request);
+}
+
+function hub(env) {
+  return env.HUB.get(env.HUB.idFromName(HUB_NAME));
+}
+
+// Holds the /listen sockets with the WebSocket Hibernation API.
+// The hub sleeps while no event comes. It has no timers and no alarms.
+export class ListenerHub extends DurableObject {
+  async fetch(request) {
+    const consumer = new URL(request.url).searchParams.get("consumer");
+    if (!isValidConsumer(consumer)) return json({ error: "invalid consumer name" }, 400);
+
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [consumer]);
+    server.send(JSON.stringify({ kind: "hello", consumer }));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Sends one event to each open socket. At most once: a failed send is not repeated.
+  async broadcast(event) {
+    const message = JSON.stringify({ kind: "event", event });
+    let sent = 0;
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(message);
+        sent++;
+      } catch {
+        // The socket is closing. The consumer gets the event from the catch-up call.
+      }
+    }
+    return sent;
+  }
+
+  // Clients send nothing. The ack uses HTTP.
+  async webSocketMessage() {}
+
+  async webSocketClose(ws, code, reason) {
+    try {
+      ws.close(code, reason);
+    } catch {
+      // The socket is already closed.
+    }
+  }
+}
+
+async function receiveHook(sourceName, request, env, ctx) {
   const source = SOURCES[sourceName];
   if (!source) return json({ error: "unknown source" }, 404);
 
@@ -143,21 +224,62 @@ async function receiveHook(sourceName, request, env) {
   const body = JSON.parse(rawBody);
   const { deliveryId, eventType, action } = source.describe(request, body);
 
-  const result = await env.DB.prepare(
+  const stored = await env.DB.prepare(
     `INSERT OR IGNORE INTO events (source, delivery_id, event_type, action, payload)
-     VALUES (?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?)
+     RETURNING id, received_at`
   )
     .bind(sourceName, deliveryId, eventType, action, rawBody)
-    .run();
+    .first();
+
+  if (stored) {
+    // The same shape as one item of GET /api/events?payload=1.
+    const event = {
+      id: stored.id,
+      source: sourceName,
+      delivery_id: deliveryId,
+      event_type: eventType,
+      action,
+      received_at: stored.received_at,
+      payload: body,
+    };
+    // The push runs after the response. A hub failure never fails the webhook.
+    ctx.waitUntil(pushToHub(env, event));
+  }
 
   // Always 200, also for a duplicate, so that the source stops its retries.
-  return json({ ok: true, duplicate: result.meta.changes === 0 });
+  return json({ ok: true, duplicate: !stored });
+}
+
+// Sends a stored event to the hub. It writes a failure to the log and never throws.
+async function pushToHub(env, event) {
+  try {
+    await hub(env).broadcast(event);
+  } catch (err) {
+    console.error(`hub push failed for event ${event.id}:`, err);
+  }
+}
+
+// Deletes events with received_at RETENTION_MS old or older, and their consume rows.
+// The consume rows go first, so that the cleanup does not depend on ON DELETE CASCADE.
+async function deleteOldEvents(env) {
+  const cutoff = new Date(Date.now() - RETENTION_MS).toISOString();
+  const [consumptions, events] = await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM consumptions WHERE event_id IN (SELECT id FROM events WHERE received_at <= ?)`
+    ).bind(cutoff),
+    env.DB.prepare(`DELETE FROM events WHERE received_at <= ?`).bind(cutoff),
+  ]);
+  console.log(
+    `cleanup: deleted ${events.meta.changes} events and ${consumptions.meta.changes} consume rows received at or before ${cutoff}`
+  );
 }
 
 // GET /api/events?source=linear&type=Issue&after=120&limit=50&payload=1
-//   &consumer=claude-runner&pending=1&consume=1
+//   &consumer=claude-runner&pending=1&settled=1&consume=1
 // Oldest first after the cursor, so a consumer can read forward with "after".
-// "pending=1" also returns oldest first, like a queue.
+// "pending=1" also returns oldest first, like a queue. It does not return settled
+// events (first consume SETTLE_AFTER_MS old or older), unless "settled=1".
 // Otherwise, returns the newest events (newest first).
 // "consume=1" marks every returned event as consumed by the consumer.
 async function listEvents(url, env) {
@@ -168,6 +290,7 @@ async function listEvents(url, env) {
   const consumer = params.get("consumer");
   const pending = params.get("pending") === "1";
   const consume = params.get("consume") === "1";
+  const settled = params.get("settled") === "1";
 
   if ((pending || consume) && !consumer) {
     return json({ error: "pending and consume need a consumer" }, 400);
@@ -191,6 +314,13 @@ async function listEvents(url, env) {
   if (pending) {
     where.push("NOT EXISTS (SELECT 1 FROM consumptions c WHERE c.event_id = events.id AND c.consumer = ?)");
     binds.push(consumer);
+    if (!settled) {
+      // A consume row this old means that the first consume is this old.
+      where.push(
+        "NOT EXISTS (SELECT 1 FROM consumptions s WHERE s.event_id = events.id AND s.consumed_at <= ?)"
+      );
+      binds.push(new Date(Date.now() - SETTLE_AFTER_MS).toISOString());
+    }
   }
 
   const order = after !== null || pending ? "ASC" : "DESC";
@@ -306,7 +436,7 @@ async function fetchEvents(env, ids, order, withPayload, consumer) {
 }
 
 function isValidConsumer(name) {
-  return typeof name === "string" && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(name);
+  return typeof name === "string" && CONSUMER_PATTERN.test(name);
 }
 
 async function readJson(request) {
